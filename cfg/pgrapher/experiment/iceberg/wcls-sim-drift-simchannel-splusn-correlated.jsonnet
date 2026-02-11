@@ -1,11 +1,14 @@
+// ============================================================================
 // wcls-sim-drift-simchannel-splusn-correlated.jsonnet
+// ============================================================================
 //
-// Replace old GroupNoiseModel/IncoherentAddNoise with CorrelatedAddNoise.
-// Assumes noise model stores:
-//   - freq_ghz : GHz (== 1/ns in WCT base time units)
-//   - avg_mag  : MV  (WCT base voltage)
+// Assumptions about the stored noise model (WCT base units):
+//   - freq_ghz : GHz  (== 1/ns in WCT base time units)
+//   - avg_mag  : MV   (WCT base voltage)
 //
-// And CorrelatedAddNoise adds noise in MV to frames in MV.
+// CorrelatedAddNoise injects noise in MV into frames in MV.
+//
+// ============================================================================
 
 local g  = import 'pgraph.jsonnet';
 local f  = import 'pgrapher/common/funcs.jsonnet';
@@ -15,9 +18,9 @@ local io           = import 'pgrapher/common/fileio.jsonnet';
 local tools_maker  = import 'pgrapher/common/tools.jsonnet';
 local params_maker = import 'pgrapher/experiment/iceberg/simparams.jsonnet';
 
-// -----------------------------------------------------------------------------
-// FHiCL-provided externals
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// (1) FHiCL-provided externals -> params/tools/sim
+// ----------------------------------------------------------------------------
 local fcl_params = {
   G4RefTime: std.extVar('G4RefTime') * wc.us,
 };
@@ -36,17 +39,18 @@ local tools = tools_maker(params);
 local sim_maker = import 'pgrapher/experiment/iceberg/sim.jsonnet';
 local sim = sim_maker(params, tools);
 
+// Anode bookkeeping
 local nanodes = std.length(tools.anodes);
 local anode_iota = std.range(0, nanodes - 1);
 
-// -----------------------------------------------------------------------------
-// HARD-CODE correlated noise model path (MV + GHz model)
-// -----------------------------------------------------------------------------
-local corr_model = "/exp/dune/app/users/avighosh/noise_model/model_files/correlated_noise_model_WCT_MV_GHz.json.bz2";
+// ----------------------------------------------------------------------------
+// (2) Noise model path (hard-coded)
+// ----------------------------------------------------------------------------
+local noise_model = "/exp/dune/app/users/avighosh/noise_model/model_files/ICEBERG_Correlated_noise_model.json.bz2";
 
-// -----------------------------------------------------------------------------
-// WCLS input
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// (3) WCLS input + MegaAnode plane definition
+// ----------------------------------------------------------------------------
 local wcls_maker = import 'pgrapher/ui/wcls/nodes.jsonnet';
 local wcls = wcls_maker(params, tools);
 
@@ -57,9 +61,6 @@ local wcls_input = {
   ),
 };
 
-// -----------------------------------------------------------------------------
-// MegaAnode plane
-// -----------------------------------------------------------------------------
 local mega_anode = {
   type: 'MegaAnodePlane',
   name: 'meganodes',
@@ -68,21 +69,20 @@ local mega_anode = {
   },
 };
 
-// -----------------------------------------------------------------------------
-// Digitization scale
-// NOTE: Despite variable name, this is effectively "ADC per WCT-voltage-unit".
+// ----------------------------------------------------------------------------
+// (4) Digitization scale (ADC per WCT-voltage-unit)
+// ----------------------------------------------------------------------------
 // params.adc.fullscale is in WCT voltage units (MV base).
-// -----------------------------------------------------------------------------
 local resolution = params.adc.resolution;
 local fullscale  = params.adc.fullscale[1] - params.adc.fullscale[0];
 local ADC_per_Vwct = ((1 << resolution) - 1) / fullscale;
 
-// -----------------------------------------------------------------------------
-// Outputs
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// (5) Outputs (frame savers + optional SP outputs)
+// ----------------------------------------------------------------------------
 local wcls_output = {
 
-  // signal waveform from simulation
+  // Signal waveform from simulation (converted to ADC using frame_scale)
   sim_signals: g.pnode({
     type: 'wclsFrameSaver',
     name: 'simsignals',
@@ -90,11 +90,11 @@ local wcls_output = {
       anode: wc.tn(mega_anode),
       digitize: true,
       frame_tags: ['sig'],
-      frame_scale: [ADC_per_Vwct],   // convert WCT voltage (MV base) -> ADC counts
+      frame_scale: [ADC_per_Vwct],
     },
   }, nin=1, nout=1, uses=[mega_anode]),
 
-  // ADC output from simulation
+  // Digitized output ("daq")
   sim_digits: g.pnode({
     type: 'wclsFrameSaver',
     name: 'simdigits',
@@ -106,20 +106,22 @@ local wcls_output = {
     },
   }, nin=1, nout=1, uses=[mega_anode]),
 
+  // Optional outputs (kept as-is)
   nf_digits: wcls.output.digits(name='nfdigits', tags=['raw']),
   sp_signals: wcls.output.signals(name='spsignals', tags=['gauss', 'wiener']),
   sp_thresholds: wcls.output.thresholds(name='spthresholds', tags=['threshold']),
 };
 
-// -----------------------------------------------------------------------------
-// Core sim chain
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// (6) Core sim chain (drift -> simchannel sink -> bagger -> signal pipelines)
+// ----------------------------------------------------------------------------
 local drifter = sim.drifter;
 local bagger  = sim.make_bagger();
 local signal_pipes = sim.signal_pipelines;
 
 local rng = tools.random;
 
+// SimChannel sink node
 local wcls_simchannel_sink = g.pnode({
   type: 'wclsSimChannelSink',
   name: 'postdrift',
@@ -143,18 +145,20 @@ local wcls_simchannel_sink = g.pnode({
   },
 }, nin=1, nout=1, uses=tools.anodes);
 
-// fan out anodes, simulate signals
-local multipass = [
+// Fan out across anodes and simulate signals
+local multipass_signal = [
   g.pipeline([ signal_pipes[n] ], 'multipass%d' % n)
   for n in anode_iota
 ];
 
-local outtags = ['orig%d' % n for n in anode_iota];
-local bi_manifold = f.fanpipe('DepoSetFanout', multipass, 'FrameFanin', 'sn_mag_nf', outtags);
+local outtags_signal = ['orig%d' % n for n in anode_iota];
+local bi_manifold_signal =
+  f.fanpipe('DepoSetFanout', multipass_signal, 'FrameFanin', 'sn_mag_nf', outtags_signal);
 
-// merge to a single tag "sig"
-local retagger = g.pnode({
+// Merge anode tags -> single "sig"
+local retagger_signal = g.pnode({
   type: 'Retagger',
+  name: 'retagger-signal',
   data: {
     tag_rules: [{
       frame: { '.*': 'orig' },
@@ -163,11 +167,12 @@ local retagger = g.pnode({
   },
 }, nin=1, nout=1);
 
-// -----------------------------------------------------------------------------
-// Correlated noise injection branch
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// (7) Noise injection branch (CORRELATED)
+//     select -> add noise -> digitize -> merge
+// ----------------------------------------------------------------------------
 
-// select per-anode channel ranges from the 'sig' frame
+// Select per-anode channel ranges from the 'sig' frame
 local chsel_pipes = [
   g.pnode({
     type: 'ChannelSelector',
@@ -180,48 +185,48 @@ local chsel_pipes = [
   for n in anode_iota
 ];
 
-// one correlated noise node per lane
-local corrnoises = [
+// One CorrelatedAddNoise per lane
+local noise_adders = [
   g.pnode({
     type: 'CorrelatedAddNoise',
     name: 'corrnoise%d' % n,
     data: {
       rng: wc.tn(tools.random),
-      model_file: corr_model,
+      model_file: noise_model,
 
       // These are in WCT base units already:
       nsamples: params.daq.nticks,
       dt: params.daq.tick,       // ns (WCT base time units)
 
-      // optional: keep at 1.0 unless you need a quick normalization tweak
+      // Keep at 1.0 unless you need a quick normalization tweak
       ifft_scale: 1.0,
     },
   }, nin=1, nout=1, uses=[tools.random])
   for n in anode_iota
 ];
 
-// digitize noisy frames into splusnN
+// Digitize noisy frames into splusnN
 local digitizers_noise = [
   sim.digitizer(tools.anodes[n], name='digitizer-noise%d' % n, tag='splusn%d' % n)
   for n in anode_iota
 ];
 
-// per-lane pipeline: select -> add noise -> digitize
+// Per-lane pipeline: select -> add noise -> digitize
 local multipass_noise = [
   g.pipeline([
     chsel_pipes[n],
-    corrnoises[n],
+    noise_adders[n],
     digitizers_noise[n],
   ], 'multipass-noise%d' % n)
   for n in anode_iota
 ];
 
-// fanout/fanin to collect the noisy digitized lanes
+// Fanout/fanin to collect the noisy digitized lanes
 local outtags_noise = ['splusn%d' % n for n in anode_iota];
 local bi_manifold_noise =
   f.fanpipe('FrameFanout', multipass_noise, 'FrameFanin', 'noisedigit', outtags_noise);
 
-// merge to final "daq"
+// Merge lane tags -> final "daq"
 local retagger_noise = g.pnode({
   type: 'Retagger',
   name: 'retagger-noise',
@@ -233,20 +238,21 @@ local retagger_noise = g.pnode({
   },
 }, nin=1, nout=1);
 
-// -----------------------------------------------------------------------------
-// Sink + app wrapper
-// -----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// (8) Sink + app wrapper
+// ----------------------------------------------------------------------------
 local sink = sim.frame_sink;
 
 local graph = g.pipeline([
+  // inputs + drift
   wcls_input.depos,
   drifter,
   wcls_simchannel_sink,
   bagger,
 
   // signal path
-  bi_manifold,
-  retagger,
+  bi_manifold_signal,
+  retagger_signal,
   wcls_output.sim_signals,
 
   // noise+digitize path
@@ -254,6 +260,7 @@ local graph = g.pipeline([
   retagger_noise,
   wcls_output.sim_digits,
 
+  // final sink
   sink
 ]);
 
